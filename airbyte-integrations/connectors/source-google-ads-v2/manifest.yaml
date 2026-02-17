@@ -826,6 +826,7 @@ streams:
 # ============================================
 dynamic_streams:
   - type: DynamicDeclarativeStream
+    name: custom_gaql_query
     stream_template:
       $ref: "#/definitions/custom_query_stream_template"
     components_resolver:
