@@ -839,7 +839,7 @@ dynamic_streams:
         - type: ComponentMappingDefinition
           field_path:
             - name
-          value: "{{ components_values['table_name'] }}"
+          value: "{{ components_values['query_name'] }}"
           create_or_update: true
         - type: ComponentMappingDefinition
           field_path:
@@ -953,13 +953,13 @@ spec:
           type: object
           required:
             - query
-            - table_name
+            - query_name
           properties:
             query:
               type: string
               title: "GAQL Query"
               description: "The GAQL query to execute"
-            table_name:
+            query_name:
               type: string
               title: "Table Name"
               description: "The name for this custom stream"
