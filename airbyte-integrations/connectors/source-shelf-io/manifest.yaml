@@ -1,0 +1,793 @@
+version: 6.44.0
+
+type: DeclarativeSource
+
+description: >
+  Airbyte connector for Shelf.io - A knowledge management platform API.
+  This connector supports exporting gems (documents, wiki pages, decision trees) 
+  via direct download, polling-based exports, and bulk export workflows.
+
+check:
+  type: CheckStream
+  stream_names:
+    - gems
+
+definitions:
+  # ==================== AUTHENTICATOR ====================
+  authenticator:
+    type: BearerAuthenticator
+    api_token: "{{ config['api_token'] }}"
+
+  # ==================== BASE REQUESTER ====================
+  base_requester:
+    type: HttpRequester
+    url_base: "https://api.shelf.io"
+    authenticator:
+      $ref: "#/definitions/authenticator"
+    request_headers:
+      Content-Type: "application/json"
+      Accept: "application/json"
+
+  # ==================== ERROR HANDLERS ====================
+  default_error_handler:
+    type: DefaultErrorHandler
+    max_retries: 5
+    backoff_strategies:
+      - type: ExponentialBackoffStrategy
+        factor: 2
+    response_filters:
+      - type: HttpResponseFilter
+        action: RETRY
+        http_codes:
+          - 429
+          - 500
+          - 502
+          - 503
+          - 504
+      - type: HttpResponseFilter
+        action: FAIL
+        http_codes:
+          - 403
+        error_message: "Permission denied. Ensure your API token has read access to the gem and its parent collection."
+      - type: HttpResponseFilter
+        action: FAIL
+        http_codes:
+          - 410
+        error_message: "Download URL has expired. Request a new export URL."
+      - type: HttpResponseFilter
+        action: FAIL
+        http_codes:
+          - 413
+        error_message: "Bulk export exceeds size limit (500MB). Reduce the number of gems or use individual exports."
+      - type: HttpResponseFilter
+        action: FAIL
+        http_codes:
+          - 422
+        error_message: "Gem has no content to download. Use the correct export method for the gem type."
+
+  # ==================== PAGINATION ====================
+  default_paginator:
+    type: DefaultPaginator
+    page_size_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "limit"
+    pagination_strategy:
+      type: OffsetIncrement
+      page_size: 100
+      inject_on_first_request: true
+    page_token_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "offset"
+
+  cursor_paginator:
+    type: DefaultPaginator
+    page_size_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "limit"
+    pagination_strategy:
+      type: CursorPagination
+      page_size: 100
+      cursor_value: "{{ response.get('nextCursor', '') }}"
+      stop_condition: "{{ response.get('nextCursor') is none or response.get('nextCursor') == '' }}"
+    page_token_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "cursor"
+
+  cil_content_paginator:
+    type: DefaultPaginator
+    page_size_option:
+      type: RequestOption
+      inject_into: body_json
+      field_name: "size"
+    pagination_strategy:
+      type: CursorPagination
+      page_size: 1000
+      cursor_value: "{{ response.get('pageInfo', {}).get('nextToken', '') }}"
+      stop_condition: "{{ not response.get('pageInfo', {}).get('hasNextPage', False) }}"
+    page_token_option:
+      type: RequestOption
+      inject_into: body_json
+      field_name: "nextToken"
+
+  # ==================== RECORD SELECTORS ====================
+  default_selector:
+    type: RecordSelector
+    extractor:
+      type: DpathExtractor
+      field_path: []
+
+  data_selector:
+    type: RecordSelector
+    extractor:
+      type: DpathExtractor
+      field_path:
+        - "data"
+
+  items_selector:
+    type: RecordSelector
+    extractor:
+      type: DpathExtractor
+      field_path:
+        - "items"
+
+  results_selector:
+    type: RecordSelector
+    extractor:
+      type: DpathExtractor
+      field_path:
+        - "results"
+
+  # ==================== INCREMENTAL SYNC ====================
+  datetime_cursor:
+    type: DatetimeBasedCursor
+    cursor_field: "updatedAt"
+    datetime_format: "%Y-%m-%dT%H:%M:%S.%fZ"
+    cursor_datetime_formats:
+      - "%Y-%m-%dT%H:%M:%S.%fZ"
+      - "%Y-%m-%dT%H:%M:%SZ"
+      - "%Y-%m-%dT%H:%M:%S%z"
+    start_datetime:
+      type: MinMaxDatetime
+      datetime: "{{ config.get('start_date', '2020-01-01T00:00:00Z') }}"
+      datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+    end_datetime:
+      type: MinMaxDatetime
+      datetime: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+      datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+    start_time_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "updatedAfter"
+    end_time_option:
+      type: RequestOption
+      inject_into: request_parameter
+      field_name: "updatedBefore"
+
+  # ==================== STREAMS ====================
+
+  # Stream: Gems (content items via CIL Content API)
+  gems_stream:
+    type: DeclarativeStream
+    name: "gems"
+    description: "Retrieves all content items (gems) from Shelf via POST /cil-content/items/list."
+    primary_key:
+      - "id"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/cil-content/items/list"
+        http_method: "POST"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/items_selector"
+      paginator:
+        $ref: "#/definitions/cil_content_paginator"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          id:
+            type:
+              - "null"
+              - string
+            description: "Unique identifier for the content item (same as internalId)"
+          accountId:
+            type:
+              - "null"
+              - string
+            description: "Account ID the content item belongs to"
+          collectionIds:
+            type:
+              - "null"
+              - array
+            items:
+              type: string
+            description: "IDs of collections this item belongs to"
+          connectorId:
+            type:
+              - "null"
+              - string
+            description: "ID of the connector that created this item"
+          createdAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the item was created"
+          externalId:
+            type:
+              - "null"
+              - string
+            description: "External identifier for the content item"
+          externalURL:
+            type:
+              - "null"
+              - string
+            description: "External URL of the content item"
+          fields:
+            type:
+              - "null"
+              - array
+            items:
+              type: object
+              additionalProperties: true
+            description: "Custom fields associated with the content item"
+          iconURL:
+            type:
+              - "null"
+              - string
+            description: "URL of the content item icon"
+          internalCollectionIds:
+            type:
+              - "null"
+              - array
+            items:
+              type: string
+            description: "Internal collection IDs"
+          internalId:
+            type:
+              - "null"
+              - string
+            description: "Internal unique identifier"
+          lang:
+            type:
+              - "null"
+              - string
+            description: "Language of the content item"
+          lastViewedAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the item was last viewed"
+          locations:
+            type:
+              - "null"
+              - array
+            items:
+              type: object
+              additionalProperties: true
+            description: "Location information for the content item"
+          originalCreatedAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Original creation timestamp"
+
+  # Stream: Gem Attachments (download URLs for documents/images)
+  gem_attachments_stream:
+    type: DeclarativeStream
+    name: "gem_attachments"
+    description: "Retrieves download URLs for gem attachments. URLs expire in 5 minutes by default."
+    primary_key:
+      - "gemId"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/content/v1/gems/{{ stream_partition['gem_id'] }}/attachment"
+        http_method: "GET"
+        request_parameters:
+          skipRedirect: "true"
+          expiresInMinutes: "{{ config.get('download_url_expiry_minutes', '5') }}"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/default_selector"
+      partition_router:
+        type: SubstreamPartitionRouter
+        parent_stream_configs:
+          - type: ParentStreamConfig
+            parent_key: "id"
+            partition_field: "gem_id"
+            stream:
+              $ref: "#/definitions/gems_stream"
+    transformations:
+      - type: AddFields
+        fields:
+          - path:
+              - "gemId"
+            value: "{{ stream_partition['gem_id'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          gemId:
+            type:
+              - "null"
+              - string
+            description: "ID of the gem this attachment belongs to"
+          url:
+            type:
+              - "null"
+              - string
+            description: "Signed download URL for the attachment"
+          expiresAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Expiration time of the download URL"
+
+  # Stream: Wiki Content (HTML export)
+  wiki_content_stream:
+    type: DeclarativeStream
+    name: "wiki_content"
+    description: "Retrieves wiki page content as HTML."
+    primary_key:
+      - "gemId"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/content/v1/gems/{{ stream_partition['gem_id'] }}/wiki-content"
+        http_method: "GET"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/default_selector"
+      partition_router:
+        type: SubstreamPartitionRouter
+        parent_stream_configs:
+          - type: ParentStreamConfig
+            parent_key: "id"
+            partition_field: "gem_id"
+            stream:
+              $ref: "#/definitions/gems_stream"
+    transformations:
+      - type: AddFields
+        fields:
+          - path:
+              - "gemId"
+            value: "{{ stream_partition['gem_id'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          gemId:
+            type:
+              - "null"
+              - string
+            description: "ID of the wiki gem"
+          content:
+            type:
+              - "null"
+              - string
+            description: "HTML content of the wiki page"
+          title:
+            type:
+              - "null"
+              - string
+            description: "Title of the wiki page"
+
+  # Stream: Decision Tree Steps
+  decision_tree_steps_stream:
+    type: DeclarativeStream
+    name: "decision_tree_steps"
+    description: "Retrieves individual decision tree step data."
+    primary_key:
+      - "gemId"
+      - "stepId"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/decision-tree/step"
+        http_method: "GET"
+        request_parameters:
+          gemId: "{{ stream_partition['gem_id'] }}"
+          stepId: "{{ stream_partition['step_id'] }}"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/default_selector"
+      partition_router:
+        - type: SubstreamPartitionRouter
+          parent_stream_configs:
+            - type: ParentStreamConfig
+              parent_key: "id"
+              partition_field: "gem_id"
+              stream:
+                $ref: "#/definitions/gems_stream"
+        - type: ListPartitionRouter
+          cursor_field: "step_id"
+          values: "{{ config.get('decision_tree_step_ids', []) }}"
+    transformations:
+      - type: AddFields
+        fields:
+          - path:
+              - "gemId"
+            value: "{{ stream_partition['gem_id'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          gemId:
+            type:
+              - "null"
+              - string
+            description: "ID of the decision tree gem"
+          stepId:
+            type:
+              - "null"
+              - string
+            description: "ID of the step"
+          question:
+            type:
+              - "null"
+              - string
+            description: "The question text for this step"
+          answerOptions:
+            type:
+              - "null"
+              - array
+            items:
+              type: object
+              properties:
+                id:
+                  type:
+                    - "null"
+                    - string
+                text:
+                  type:
+                    - "null"
+                    - string
+                nextStepId:
+                  type:
+                    - "null"
+                    - string
+            description: "Available answer options for this step"
+          metadata:
+            type:
+              - "null"
+              - object
+            additionalProperties: true
+            properties:
+              totalSteps:
+                type:
+                  - "null"
+                  - integer
+              treeVersion:
+                type:
+                  - "null"
+                  - integer
+
+  # Stream: Bulk Export Jobs
+  bulk_export_jobs_stream:
+    type: DeclarativeStream
+    name: "bulk_export_jobs"
+    description: "Retrieves status and download URLs for bulk export jobs."
+    primary_key:
+      - "exportJobId"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/gems/attachments/export-jobs/{{ stream_partition['job_id'] }}"
+        http_method: "GET"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/default_selector"
+      partition_router:
+        type: ListPartitionRouter
+        cursor_field: "job_id"
+        values: "{{ config.get('bulk_export_job_ids', []) }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          exportJobId:
+            type:
+              - "null"
+              - string
+            description: "Unique identifier for the export job"
+          status:
+            type:
+              - "null"
+              - string
+            description: "Current status of the export job (processing, completed, failed)"
+          itemCount:
+            type:
+              - "null"
+              - integer
+            description: "Number of items in the export"
+          url:
+            type:
+              - "null"
+              - string
+            description: "Download URL for the completed export (ZIP archive)"
+          createdAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the job was created"
+          completedAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the job completed"
+          error:
+            type:
+              - "null"
+              - object
+            additionalProperties: true
+            description: "Error details if the job failed"
+
+  # Stream: Wiki PDF Export (Polling Flow)
+  wiki_pdf_exports_stream:
+    type: DeclarativeStream
+    name: "wiki_pdf_exports"
+    description: "Retrieves PDF export URLs for wiki pages using the polling workflow."
+    primary_key:
+      - "gemId"
+      - "exportId"
+    retriever:
+      type: AsyncRetriever/
+      record_selector:
+        $ref: "#/definitions/default_selector"
+      status_mapping:
+        type: AsyncJobStatusMap
+        running:
+          - "processing"
+          - "pending"
+          - "in_progress"
+        completed:
+          - "completed"
+          - "ready"
+          - "done"
+        failed:
+          - "failed"
+          - "error"
+        timeout:
+          - "timeout"
+          - "expired"
+      status_extractor:
+        type: DpathExtractor
+        field_path:
+          - "status"
+      download_target_extractor:
+        type: DpathExtractor
+        field_path:
+          - "url"
+      creation_requester:
+        $ref: "#/definitions/base_requester"
+        path: "/previews/{{ stream_partition['gem_id'] }}/wiki/pdf/request"
+        http_method: "GET"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      polling_requester:
+        $ref: "#/definitions/base_requester"
+        path: "/previews/{{ stream_partition['gem_id'] }}/wiki/pdf/download-url"
+        http_method: "GET"
+        request_parameters:
+          exportId: "{{ creation_response['exportId'] }}"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      download_requester:
+        $ref: "#/definitions/base_requester"
+        path: "{{ download_target }}"
+        http_method: "GET"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      partition_router:
+        type: SubstreamPartitionRouter
+        parent_stream_configs:
+          - type: ParentStreamConfig
+            parent_key: "id"
+            partition_field: "gem_id"
+            stream:
+              $ref: "#/definitions/gems_stream"
+      polling_job_timeout: 5
+    transformations:
+      - type: AddFields
+        fields:
+          - path:
+              - "gemId"
+            value: "{{ stream_partition['gem_id'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          gemId:
+            type:
+              - "null"
+              - string
+            description: "ID of the wiki gem"
+          exportId:
+            type:
+              - "null"
+              - string
+            description: "ID of the export job"
+          url:
+            type:
+              - "null"
+              - string
+            description: "Download URL for the generated PDF"
+          status:
+            type:
+              - "null"
+              - string
+            description: "Status of the PDF generation"
+
+  # Stream: User Groups (for permission management context)
+  user_groups_stream:
+    type: DeclarativeStream
+    name: "user_groups"
+    description: "Retrieves user groups for understanding gem access permissions."
+    primary_key:
+      - "id"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        $ref: "#/definitions/base_requester"
+        path: "/admin/v1/user-groups"
+        http_method: "GET"
+        error_handler:
+          $ref: "#/definitions/default_error_handler"
+      record_selector:
+        $ref: "#/definitions/items_selector"
+      paginator:
+        $ref: "#/definitions/cursor_paginator"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        $schema: "http://json-schema.org/draft-07/schema#"
+        type: object
+        additionalProperties: true
+        properties:
+          id:
+            type:
+              - "null"
+              - string
+            description: "Unique identifier for the user group"
+          name:
+            type:
+              - "null"
+              - string
+            description: "Name of the user group"
+          description:
+            type:
+              - "null"
+              - string
+            description: "Description of the user group"
+          memberCount:
+            type:
+              - "null"
+              - integer
+            description: "Number of members in the group"
+          permissions:
+            type:
+              - "null"
+              - array
+            items:
+              type: string
+            description: "Permissions granted to this group"
+          createdAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the group was created"
+          updatedAt:
+            type:
+              - "null"
+              - string
+            format: date-time
+            description: "Timestamp when the group was last updated"
+
+streams:
+  - $ref: "#/definitions/gems_stream"
+  - $ref: "#/definitions/gem_attachments_stream"
+  - $ref: "#/definitions/wiki_content_stream"
+  - $ref: "#/definitions/decision_tree_steps_stream"
+  - $ref: "#/definitions/bulk_export_jobs_stream"
+  - $ref: "#/definitions/wiki_pdf_exports_stream"
+  - $ref: "#/definitions/user_groups_stream"
+
+spec:
+  type: Spec
+  documentation_url: "https://docs.shelf.io/api"
+  connection_specification:
+    $schema: "http://json-schema.org/draft-07/schema#"
+    type: object
+    required:
+      - api_token
+    additionalProperties: true
+    properties:
+      api_token:
+        type: string
+        title: "API Token"
+        description: "Your Shelf API token for authentication. This token should have read access to the gems and collections you want to sync."
+        airbyte_secret: true
+        order: 0
+      start_date:
+        type: string
+        title: "Start Date"
+        description: "The date from which to start syncing data (ISO 8601 format). Only gems updated after this date will be synced."
+        format: date-time
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        examples:
+          - "2024-01-01T00:00:00Z"
+        order: 1
+      download_url_expiry_minutes:
+        type: integer
+        title: "Download URL Expiry (Minutes)"
+        description: "How long download URLs should remain valid. Default is 5 minutes, maximum is 60 minutes."
+        minimum: 1
+        maximum: 60
+        default: 5
+        order: 2
+      bulk_export_job_ids:
+        type: array
+        title: "Bulk Export Job IDs"
+        description: "List of bulk export job IDs to monitor. Leave empty if not using bulk exports."
+        items:
+          type: string
+        default: []
+        order: 3
+      decision_tree_step_ids:
+        type: array
+        title: "Decision Tree Step IDs"
+        description: "List of specific decision tree step IDs to fetch. Leave empty to skip decision tree step exports."
+        items:
+          type: string
+        default: []
+        order: 4
+
+metadata:
+  autoImportSchema:
+    gems: false
+    gem_attachments: false
+    wiki_content: false
+    decision_tree_steps: false
+    bulk_export_jobs: false
+    wiki_pdf_exports: false
+    user_groups: false
