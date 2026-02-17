@@ -108,6 +108,39 @@ definitions:
           - _airbyte_extracted_at
         value: "{{ now_utc().strftime('%Y-%m-%dT%H:%M:%SZ') }}"
 
+  # ============================================
+  # CUSTOM QUERY STREAM TEMPLATE
+  # ============================================
+  custom_query_stream_template:
+    type: DeclarativeStream
+    name: "custom_query"
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://googleads.googleapis.com/v22"
+        path: "/customers/{{ config['customer_id'] | replace('-', '') }}/googleAds:search"
+        http_method: POST
+        authenticator:
+          $ref: "#/definitions/oauth_authenticator"
+        request_headers:
+          Content-Type: "application/json"
+          developer-token: "{{ config['developer_token'] }}"
+          login-customer-id: "{{ config['login_customer_id'] | replace('-', '') if config.get('login_customer_id') else config['customer_id'] | replace('-', '') }}"
+        request_body_json:
+          query: "placeholder"
+          pageSize: 10000
+      record_selector:
+        $ref: "#/definitions/search_selector"
+      paginator:
+        $ref: "#/definitions/search_paginator"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        additionalProperties: true
+        properties: {}
+
 # ============================================
 # STREAMS
 # ============================================
@@ -787,6 +820,34 @@ streams:
         $ref: "#/definitions/search_selector"
       paginator:
         $ref: "#/definitions/search_paginator"
+
+# ============================================
+# DYNAMIC STREAMS (Custom GAQL Queries)
+# ============================================
+dynamic_streams:
+  - type: DynamicDeclarativeStream
+    stream_template:
+      $ref: "#/definitions/custom_query_stream_template"
+    components_resolver:
+      type: ConfigComponentsResolver
+      stream_config:
+        type: StreamConfig
+        configs_pointer:
+          - custom_queries
+      components_mapping:
+        - type: ComponentMappingDefinition
+          field_path:
+            - name
+          value: "{{ components_values['table_name'] }}"
+          create_or_update: true
+        - type: ComponentMappingDefinition
+          field_path:
+            - retriever
+            - requester
+            - request_body_json
+            - query
+          value: "{{ components_values['query'] }}"
+          create_or_update: true
 
 # ============================================
 # CONNECTOR SPECIFICATION
