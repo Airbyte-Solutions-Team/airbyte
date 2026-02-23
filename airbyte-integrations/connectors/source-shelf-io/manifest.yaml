@@ -567,7 +567,7 @@ definitions:
       - "gemId"
       - "exportId"
     retriever:
-      type: AsyncRetriever/
+      type: AsyncRetriever
       record_selector:
         $ref: "#/definitions/default_selector"
       status_mapping:
