@@ -114,6 +114,8 @@ definitions:
   custom_query_stream_template:
     type: DeclarativeStream
     name: "custom_query"
+    $parameters:
+      _custom_query: "SELECT campaign.id FROM campaign"  # placeholder, overridden at runtime
     retriever:
       type: SimpleRetriever
       requester:
@@ -128,7 +130,20 @@ definitions:
           developer-token: "{{ config['developer_token'] }}"
           login-customer-id: "{{ config['login_customer_id'] | replace('-', '') if config.get('login_customer_id') else config['customer_id'] | replace('-', '') }}"
         request_body_json:
-          query: "placeholder"
+          query: >-
+            {%- set q = parameters['_custom_query'] -%}
+            {%- if stream_slice.get('start_time') -%}
+              {%- set date_filter = "segments.date >= '" ~ stream_slice['start_time'] ~ "' AND segments.date <= '" ~ stream_slice.get('end_time', today_utc().strftime('%Y-%m-%d')) ~ "'" -%}
+              {%- if q | regex_search('(?i)\\bORDER\\s+BY\\b') -%}
+                {{ q | regex_replace('(?i)(\\bORDER\\s+BY\\b)', ('AND ' if q | regex_search('(?i)\\bWHERE\\b') else 'WHERE ') ~ date_filter ~ ' ORDER BY ') }}
+              {%- elif q | regex_search('(?i)\\bWHERE\\b') -%}
+                {{ q }} AND {{ date_filter }}
+              {%- else -%}
+                {{ q }} WHERE {{ date_filter }}
+              {%- endif -%}
+            {%- else -%}
+              {{ q }}
+            {%- endif %}
           pageSize: 10000
       record_selector:
         $ref: "#/definitions/search_selector"
@@ -843,11 +858,37 @@ dynamic_streams:
           create_or_update: true
         - type: ComponentMappingDefinition
           field_path:
-            - retriever
-            - requester
-            - request_body_json
-            - query
+            - $parameters
+            - _custom_query
           value: "{{ components_values['query'] }}"
+          create_or_update: true
+        - type: ComponentMappingDefinition
+          field_path:
+            - incremental_sync
+          value: >-
+            {
+              "type": "DatetimeBasedCursor",
+              "cursor_field": "segments.date",
+              "datetime_format": "%Y-%m-%d",
+              "cursor_granularity": "P1D",
+              "step": "P1D",
+              "lookback_window": "P3D",
+              "start_datetime": {
+                "type": "MinMaxDatetime",
+                "datetime": "{{ config.get('start_date', day_delta(-365, format='%Y-%m-%d')) }}",
+                "datetime_format": "%Y-%m-%d"
+              },
+              "end_datetime": {
+                "type": "MinMaxDatetime",
+                "datetime": "{{ config.get('end_date', today_utc().strftime('%Y-%m-%d')) }}",
+                "datetime_format": "%Y-%m-%d"
+              }
+            }
+          condition: >-
+            {{
+              components_values.get('query', '').count('segments.date') == 1
+              and (components_values.get('query') | regex_search('(?i)(\\bSELECT\\b[\\s\\S]*?segments\\.date[\\s\\S]*?\\bFROM\\b)'))
+            }}
           create_or_update: true
 
 # ============================================
