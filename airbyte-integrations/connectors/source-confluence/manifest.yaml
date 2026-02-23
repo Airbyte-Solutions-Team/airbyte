@@ -8,6 +8,31 @@ check:
     - space
 
 definitions:
+  api_token_auth:
+    type: BasicHttpAuthenticator
+    username: "{{ config['credentials']['email'] }}"
+    password: "{{ config['credentials']['api_token'] }}"
+
+  oauth2_auth:
+    type: OAuthAuthenticator
+    client_id: "{{ config['credentials']['client_id'] }}"
+    client_secret: "{{ config['credentials']['client_secret'] }}"
+    refresh_token: "{{ config['credentials']['refresh_token'] }}"
+    access_token_value: "{{ config['credentials'].get('access_token', '') }}"
+    token_refresh_endpoint: "https://auth.atlassian.com/oauth/token"
+    scopes:
+      - read:confluence-content.all
+      - read:confluence-space.summary
+      - read:confluence-user
+      - offline_access
+
+  authenticator:
+    type: SelectiveAuthenticator
+    authenticator_selection_path: ["credentials", "auth_type"]
+    authenticators:
+      api_token: "#/definitions/api_token_auth"
+      oauth2.0: "#/definitions/oauth2_auth"
+
   streams:
     audit:
       type: DeclarativeStream
@@ -197,13 +222,61 @@ definitions:
         type: InlineSchemaLoader
         schema:
           $ref: "#/schemas/space"
+    page_trees:
+      type: DeclarativeStream
+      name: page_trees
+      primary_key:
+        - id
+      retriever:
+        type: SimpleRetriever
+        requester:
+          $ref: "#/definitions/base_requester"
+          path: wiki/rest/api/content/search
+          http_method: GET
+          request_parameters:
+            cql: >-
+              (id = '{{ stream_partition.ancestor_id }}'
+               OR ancestor = '{{ stream_partition.ancestor_id }}')
+               AND type = page
+            expand: "version,body.storage,history,space,ancestors"
+        record_selector:
+          type: RecordSelector
+          extractor:
+            type: DpathExtractor
+            field_path:
+              - results
+        paginator:
+          type: DefaultPaginator
+          page_token_option:
+            type: RequestOption
+            field_name: start
+            inject_into: request_parameter
+          page_size_option:
+            type: RequestOption
+            field_name: limit
+            inject_into: request_parameter
+          pagination_strategy:
+            type: OffsetIncrement
+            page_size: 25
+        partition_router:
+          type: ListPartitionRouter
+          values: "{{ config.get('ancestor_page_ids', []) }}"
+          cursor_field: ancestor_id
+        decoder:
+          type: JsonDecoder
+      schema_loader:
+        type: InlineSchemaLoader
+        schema:
+          $ref: "#/schemas/page_trees"
+
   base_requester:
     type: HttpRequester
-    url_base: https://{{ config['domain_name'] }}/
+    url_base: >-
+      {{ 'https://api.atlassian.com/ex/confluence/' + config['credentials']['cloud_id'] + '/'
+         if config['credentials']['auth_type'] == 'oauth2.0'
+         else 'https://' + config['credentials']['domain_name'] + '/' }}
     authenticator:
-      type: BasicHttpAuthenticator
-      password: "{{ config[\"api_token\"] }}"
-      username: "{{ config[\"email\"] }}"
+      $ref: "#/definitions/authenticator"
 
 streams:
   - $ref: "#/definitions/streams/audit"
@@ -211,6 +284,7 @@ streams:
   - $ref: "#/definitions/streams/group"
   - $ref: "#/definitions/streams/pages"
   - $ref: "#/definitions/streams/space"
+  - $ref: "#/definitions/streams/page_trees"
 
 spec:
   type: Spec
@@ -218,32 +292,141 @@ spec:
     type: object
     $schema: http://json-schema.org/draft-07/schema#
     required:
-      - email
-      - api_token
-      - domain_name
+      - credentials
     properties:
-      email:
-        type: string
-        description: Your Confluence login email
+      credentials:
+        title: Authentication
+        type: object
         order: 0
-        title: Email
-        examples:
-          - abc@example.com
-      api_token:
-        type: string
+        oneOf:
+          - title: API Token
+            type: object
+            required:
+              - auth_type
+              - email
+              - api_token
+              - domain_name
+            properties:
+              auth_type:
+                type: string
+                const: api_token
+                default: api_token
+                order: 0
+              email:
+                type: string
+                title: Email
+                description: Your Confluence login email
+                examples:
+                  - abc@example.com
+                order: 1
+              api_token:
+                type: string
+                title: API Token
+                description: >-
+                  Please follow the Jira confluence for generating an API token: <a
+                  href="https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/">generating
+                  an API token</a>.
+                airbyte_secret: true
+                order: 2
+              domain_name:
+                type: string
+                title: Domain Name
+                description: "Your Confluence domain name, e.g. yourcompany.atlassian.net"
+                order: 3
+          - title: OAuth 2.0
+            type: object
+            required:
+              - auth_type
+              - client_id
+              - client_secret
+              - refresh_token
+              - cloud_id
+            properties:
+              auth_type:
+                type: string
+                const: oauth2.0
+                default: oauth2.0
+                order: 0
+              client_id:
+                type: string
+                title: Client ID
+                order: 1
+              client_secret:
+                type: string
+                title: Client Secret
+                airbyte_secret: true
+                order: 2
+              refresh_token:
+                type: string
+                title: Refresh Token
+                airbyte_secret: true
+                order: 3
+              access_token:
+                type: string
+                title: Access Token
+                airbyte_secret: true
+                order: 4
+              cloud_id:
+                type: string
+                title: Cloud ID
+                description: "Your Atlassian Cloud ID from the accessible-resources API"
+                order: 5
+      ancestor_page_ids:
+        type: array
+        items:
+          type: string
+        title: Ancestor Page IDs
         description: >-
-          Please follow the Jira confluence for generating an API token: <a
-          href="https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/">generating
-          an API token</a>.
+          Optional. Provide top-level page IDs to selectively ingest those pages and
+          all their descendants (recursively). If omitted, use the `pages` stream for
+          full ingestion.
         order: 1
-        title: API Token
-        airbyte_secret: true
-      domain_name:
-        type: string
-        description: Your Confluence domain name
-        order: 2
-        title: Domain name
+        examples:
+          - ["123456", "789012"]
     additionalProperties: true
+  advanced_auth:
+    auth_flow_type: oauth2.0
+    predicate_key:
+      - credentials
+      - auth_type
+    predicate_value: oauth2.0
+    oauth_config_specification:
+      complete_oauth_output_specification:
+        type: object
+        additionalProperties: false
+        properties:
+          access_token:
+            type: string
+            path_in_connector_config:
+              - credentials
+              - access_token
+          refresh_token:
+            type: string
+            path_in_connector_config:
+              - credentials
+              - refresh_token
+      complete_oauth_server_input_specification:
+        type: object
+        additionalProperties: false
+        properties:
+          client_id:
+            type: string
+          client_secret:
+            type: string
+      complete_oauth_server_output_specification:
+        type: object
+        additionalProperties: false
+        properties:
+          client_id:
+            type: string
+            path_in_connector_config:
+              - credentials
+              - client_id
+          client_secret:
+            type: string
+            path_in_connector_config:
+              - credentials
+              - client_secret
 
 metadata:
   autoImportSchema:
@@ -252,6 +435,7 @@ metadata:
     group: false
     pages: false
     space: false
+    page_trees: false
   testedStreams:
     audit:
       streamHash: b5a00bf9721bfb59848a3e1532c90b46545a570a
@@ -263,6 +447,8 @@ metadata:
       streamHash: 040df0f11ccf4ade7031617951b809adf5b969fb
     space:
       streamHash: fabb0603908ac064a4717ad62454968d184e83f8
+    page_trees:
+      streamHash: ""
   assist: {}
 
 schemas:
@@ -498,3 +684,98 @@ schemas:
           webui:
             type: string
     additionalProperties: true
+  page_trees:
+    type: object
+    $schema: http://json-schema.org/draft-07/schema#
+    additionalProperties: true
+    properties:
+      id:
+        type:
+          - string
+          - "null"
+      type:
+        type:
+          - string
+          - "null"
+      status:
+        type:
+          - string
+          - "null"
+      title:
+        type:
+          - string
+          - "null"
+      space:
+        type:
+          - object
+          - "null"
+        properties:
+          key:
+            type:
+              - string
+              - "null"
+          name:
+            type:
+              - string
+              - "null"
+      version:
+        type:
+          - object
+          - "null"
+        properties:
+          number:
+            type:
+              - integer
+              - "null"
+          when:
+            type:
+              - string
+              - "null"
+            format: date-time
+          by:
+            type:
+              - object
+              - "null"
+          message:
+            type:
+              - string
+              - "null"
+          minorEdit:
+            type:
+              - boolean
+              - "null"
+      ancestors:
+        type:
+          - array
+          - "null"
+      body:
+        type:
+          - object
+          - "null"
+        properties:
+          storage:
+            type:
+              - object
+              - "null"
+      history:
+        type:
+          - object
+          - "null"
+        properties:
+          createdDate:
+            type:
+              - string
+              - "null"
+            format: date-time
+          createdBy:
+            type:
+              - object
+              - "null"
+          lastUpdated:
+            type:
+              - object
+              - "null"
+      _links:
+        type:
+          - object
+          - "null"
